@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import sys
+import numpy as np
+from scapy.all import rdpcap
+
+def analizar_espectro_pcap(archivo_pcap, ip_filtrada=None, fs=20.0):
+    print("[*] Cargando captura: {}".format(archivo_pcap))
+    paquetes = rdpcap(archivo_pcap)
+    
+    tiempos = []
+    for pkt in paquetes:
+        if pkt.haslayer("IP"):
+            if ip_filtrada is None or pkt["IP"].src == ip_filtrada or pkt["IP"].dst == ip_filtrada:
+                tiempos.append(float(pkt.time))
+                
+    if len(tiempos) < 10:
+        print("[-] Insuficientes paquetes para realizar el analisis espectral.")
+        return
+
+    tiempos = np.array(tiempos)
+    tiempos = tiempos - tiempos[0] # Normalizar inicio en t = 0s
+    duracion_total = tiempos[-1]
+    
+    # Discretizar la senal en el dominio del tiempo (conteo de paquetes por intervalo dt = 1/fs)
+    dt = 1.0 / fs
+    num_muestras = int(np.ceil(duracion_total * fs))
+    bins = np.linspace(0, duracion_total, num_muestras + 1)
+    senal_temporal, _ = np.histogram(tiempos, bins=bins)
+    
+    # Eliminar componente de continua (DC) restando la media para evitar pico en 0 Hz
+    senal_ac = senal_temporal - np.mean(senal_temporal)
+    
+    # Aplicar ventana de Hanning para reducir fuga espectral (spectral leakage)
+    ventana = np.hanning(len(senal_ac))
+    senal_ventaneada = senal_ac * ventana
+    
+    # Calcular la Transformada Rapida de Fourier para senales reales (rfft)
+    espectro = np.fft.rfft(senal_ventaneada)
+    magnitudes = np.abs(espectro)
+    frecuencias = np.fft.rfftfreq(len(senal_ventaneada), d=dt)
+    
+    # Evaluar relacion pico-promedio (PAPR) para detectar automatizacion periodica
+    indice_pico = np.argmax(magnitudes)
+    frecuencia_dominante = frecuencias[indice_pico]
+    magnitud_pico = magnitudes[indice_pico]
+    magnitud_media = np.mean(magnitudes)
+    relacion_pico_media = magnitud_pico / (magnitud_media + 1e-9)
+    
+    print("\n--- RESULTADOS DEL ANALISIS ESPECTRAL (FFT) ---")
+    print("Duracion analizada:      {:.2f} segundos".format(duracion_total))
+    print("Paquetes procesados:     {}".format(len(tiempos)))
+    print("Frecuencia de muestreo:  {} Hz (dt = {} s)".format(fs, dt))
+    print("Frecuencia dominante:    {:.2f} Hz".format(frecuencia_dominante))
+    print("Magnitud del pico:       {:.2f}".format(magnitud_pico))
+    print("Relacion Pico/Promedio:  {:.2f}".format(relacion_pico_media))
+    
+    # Umbral empirico: una relacion > 6.0 indica fuerte periodicidad artificial
+    if relacion_pico_media > 6.0 and frecuencia_dominante > 0.2:
+        print("[ALERTA] Se detecto un patron de trafico periodico automatizado en {:.2f} Hz.".format(frecuencia_dominante))
+    else:
+        print("[OK] El espectro corresponde a trafico aperiodico / humano normal.")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Uso: python3 analisis_fft.py <archivo.pcap> [IP_A_FILTRAR]")
+        sys.exit(1)
+        
+    pcap_path = sys.argv[1]
+    ip_target = sys.argv[2] if len(sys.argv) > 2 else None
+    analizar_espectro_pcap(pcap_path, ip_target)
